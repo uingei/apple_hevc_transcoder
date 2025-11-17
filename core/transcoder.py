@@ -208,35 +208,55 @@ def calculate_nvenc_hevc_level(info: VideoInfo) -> Tuple[str, str, str, str]:
         level = "5.2"
     return level, tier, profile, pix_fmt
 
-def compute_aligned_gop(fps: float, preferred_gop_sec: float, max_gop_frames: int = 240):
+def compute_aligned_gop(fps: float, preferred_gop_sec: float, max_gop_frames: int = 240) -> int:
     """
-    返回以帧为单位的 gop_frames，优先对齐到整数秒（处理常见分数 fps，如 24000/1001）
+    返回 GOP 帧数，优先对齐到整数秒。
+    - fps: 视频帧率（可为非整数，如 23.976, 29.97, 59.94）
+    - preferred_gop_sec: 首选 GOP 秒数
+    - max_gop_frames: 最大允许 GOP 帧数
     """
+    # 安全保护
+    fps = max(1.0, fps)
+    gop_frames_approx = preferred_gop_sec * fps
+    gop_frames_approx = max(2, min(gop_frames_approx, max_gop_frames))
+
     try:
         frac = Fraction(str(fps)).limit_denominator(1001)
         fps_num, fps_den = frac.numerator, frac.denominator
     except Exception:
         fps_num, fps_den = int(round(fps)), 1
 
-    gop_frames_approx = preferred_gop_sec * fps
     best = None
     best_diff = float('inf')
-    # 尝试 1..8 秒整秒的 GOP 候选（可根据需要扩大）
+
+    # 尝试 1..8 秒整秒候选 GOP
     for n in range(1, 9):
-        # candidate_frames = fps * n = (fps_num/fps_den) * n
         candidate_frames = round(fps_num * n / fps_den)
-        if candidate_frames < 2:
-            continue
-        if candidate_frames > max_gop_frames:
+        if candidate_frames < 2 or candidate_frames > max_gop_frames:
             continue
         diff = abs(candidate_frames - gop_frames_approx)
         if diff < best_diff:
-            best = int(candidate_frames)
+            best = candidate_frames
             best_diff = diff
+
+    # fallback 保守值
     if best is None:
-        # fallback 保守值
-        best = min(max(2, int(round(gop_frames_approx))), max_gop_frames)
-    best = max(2, min(best, max_gop_frames))
+        best = int(round(gop_frames_approx))
+        best = max(2, min(best, max_gop_frames))
+
+    # 整数 FPS 再对齐（原逻辑）
+    if abs(round(fps) - fps) < 1e-6:
+        fps_int = int(round(fps))
+        n = max(1, round(best / fps_int))
+        best = max(2, min(fps_int * n, max_gop_frames))
+
+    # 分数 FPS 再对齐（增强版，NTSC 29.97/59.94 等）
+    else:
+        # 尽量对齐到整数秒
+        gop_sec_approx = best / fps  # 当前 GOP 秒数
+        n_sec = max(1, round(gop_sec_approx))
+        best = min(max_gop_frames, max(2, round(fps * n_sec)))
+
     return best
 
 # -------------------- Replacement: calculate_dynamic_values --------------------
