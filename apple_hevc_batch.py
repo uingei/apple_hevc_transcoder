@@ -130,20 +130,13 @@ def probe_media(file_path: Path) -> VideoInfo:
         if not v:
             raise ValueError("没有找到视频流")
 
-        frames = info.get("frames", [])
-
         width  = int(v.get('width') or 1920)
         height = int(v.get('height') or 1080)
 
-        # FPS
+        # FPS 处理
         rate = v.get('avg_frame_rate') or v.get('r_frame_rate') or "30/1"
-        # 修复 iPhone / ProRes 常见伪 FPS："0/0"、"90000/90000"
         if rate in ("0/0", "N/A", "90000/90000"):
-            r2 = v.get("r_frame_rate")
-            if r2 not in ("0/0", "90000/90000", None):
-                rate = r2
-            else:
-                rate = "30/1"
+            rate = v.get("r_frame_rate") or "30/1"
         try:
             num, den = map(int, rate.split('/'))
             fps = num / den if den else 30.0
@@ -154,13 +147,10 @@ def probe_media(file_path: Path) -> VideoInfo:
         tags = info.get('format', {}).get('tags', {}) or {}
         vtags = v.get('tags', {}) or {}
 
-        # Stream first, then tags fallback
         color_primaries = (v.get('color_primaries') or vtags.get('COLOR_PRIMARIES')
                            or tags.get('COLOR_PRIMARIES') or 'bt709').lower()
-
         color_transfer = (v.get('color_transfer') or vtags.get('COLOR_TRANSFER')
                           or tags.get('COLOR_TRANSFER') or 'bt709').lower()
-
         color_space = (v.get('color_space') or vtags.get('COLOR_SPACE')
                        or tags.get('COLOR_SPACE') or 'bt709').lower()
         if color_space.startswith("bt2020"):
@@ -170,11 +160,10 @@ def probe_media(file_path: Path) -> VideoInfo:
 
         # chroma location
         chromaloc = v.get('chroma_location') or tags.get('chroma_location') or 'left'
-        chromaloc_map = {"left": 0, "center": 1}
-        chromaloc_val = chromaloc_map.get(chromaloc.lower(), 0)
+        chromaloc_val = 0 if chromaloc.lower() == 'left' else 1
 
-        # -------------------- side_data_list (HDR INFO) --------------------
-        side = v.get('side_data_list', []) or []
+        # -------------------- HDR (只使用 stream-level + tags fallback) --------------------
+        side = v.get('side_data_list') or []
 
         mastering_display = ''
         max_cll = ''
@@ -188,34 +177,15 @@ def probe_media(file_path: Path) -> VideoInfo:
                     f"WP({sd['white_point_x']},{sd['white_point_y']})"
                     f"L({sd['max_luminance']},{sd['min_luminance']})"
                 )
-
             if sd.get('side_data_type') == 'Content light level metadata':
                 max_cll = f"{sd.get('max_content')},{sd.get('max_average')}"
 
-        if (not mastering_display) or (not max_cll):
-            for fr in frames[:40]:   # 前 40 帧足够
-                sdl = fr.get("side_data_list") or []
-                for sd in sdl:
-                    if sd.get("side_data_type") == "Mastering display metadata" and not mastering_display:
-                        mastering_display = (
-                            f"G({sd['green_x']},{sd['green_y']})"
-                            f"B({sd['blue_x']},{sd['blue_y']})"
-                            f"R({sd['red_x']},{sd['red_y']})"
-                            f"WP({sd['white_point_x']},{sd['white_point_y']})"
-                            f"L({sd['max_luminance']},{sd['min_luminance']})"
-                        )
-
-                    if sd.get("side_data_type") == "Content light level metadata" and not max_cll:
-                        max_cll = f"{sd.get('max_content')},{sd.get('max_average')}"
-
         # fallback to tags
         if not mastering_display:
-            mastering_display = tags.get('master-display', tags.get('MASTER_DISPLAY', ''))
-
+            mastering_display = tags.get('master-display') or tags.get('MASTER_DISPLAY') or ''
         if not max_cll:
-            max_cll = tags.get('max-cll', tags.get('MAX_CLL', ''))
+            max_cll = tags.get('max-cll') or tags.get('MAX_CLL') or ''
 
-        # -------------------- HDR DETECTION --------------------
         hdr_flag = (
             "2020" in color_primaries or
             "2020" in color_space or
@@ -223,7 +193,7 @@ def probe_media(file_path: Path) -> VideoInfo:
             mastering_display or
             "pq" in color_transfer or
             "smpte2084" in color_transfer or
-            "arib-std-b67" in color_transfer      # HLG
+            "arib-std-b67" in color_transfer
         )
 
         # -------------------- AUDIO --------------------
@@ -239,7 +209,7 @@ def probe_media(file_path: Path) -> VideoInfo:
             audio_lang = None
             audio_channels = 0
 
-        # -------------------- duration / frames --------------------
+        # -------------------- duration / frame count --------------------
         try:
             nb_frames = int(v.get('nb_frames')) if v.get('nb_frames') else None
         except:
