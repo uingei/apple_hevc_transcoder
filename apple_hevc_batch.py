@@ -69,6 +69,7 @@ class VideoInfo:
     audio_language: Optional[str] = 'eng'  # 新增字段，用于继承源语言
     nb_frames: Optional[int] = None
     duration: Optional[float] = None
+    chromaloc: int = 0
 
 @dataclass
 class FFmpegParams:
@@ -113,73 +114,154 @@ def check_tools():
 def probe_media(file_path: Path) -> VideoInfo:
     try:
         result = subprocess.run(
-            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', str(file_path)],
+            [
+                'ffprobe', '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_streams', '-show_format',
+                str(file_path)
+            ],
             capture_output=True, text=True, check=True, encoding='utf-8'
         )
+
         info = json.loads(result.stdout)
+
+        # -------------------- VIDEO STREAM --------------------
         v = next((s for s in info.get('streams', []) if s.get('codec_type') == 'video'), None)
         if not v:
             raise ValueError("没有找到视频流")
-        width = int(v.get('width') or 1920)
+
+        frames = info.get("frames", [])
+
+        width  = int(v.get('width') or 1920)
         height = int(v.get('height') or 1080)
-        rate = v.get('avg_frame_rate') or v.get('r_frame_rate') or '30/1'
-        if rate.strip() == "0/0" or not rate.strip():
+
+        # FPS
+        rate = v.get('avg_frame_rate') or v.get('r_frame_rate') or "30/1"
+        # 修复 iPhone / ProRes 常见伪 FPS："0/0"、"90000/90000"
+        if rate in ("0/0", "N/A", "90000/90000"):
+            r2 = v.get("r_frame_rate")
+            if r2 not in ("0/0", "90000/90000", None):
+                rate = r2
+            else:
+                rate = "30/1"
+        try:
+            num, den = map(int, rate.split('/'))
+            fps = num / den if den else 30.0
+        except:
             fps = 30.0
-        else:
-            try:
-                num, den = map(int, rate.split('/'))
-                fps = num / den if den else 30.0
-            except Exception:
-                fps = 30.0
 
+        # -------------------- COLOR METADATA --------------------
         tags = info.get('format', {}).get('tags', {}) or {}
-        color_primaries = (v.get('color_primaries') or tags.get('COLOR_PRIMARIES') or tags.get('color_primaries') or 'bt709').lower()
-        color_transfer = (v.get('color_transfer') or tags.get('COLOR_TRANSFER') or tags.get('color_transfer') or 'bt709').lower()
-        color_space = (v.get('color_space') or tags.get('COLOR_SPACE') or tags.get('color_space') or 'bt709').lower()
-        pix_fmt = (v.get('pix_fmt') or '').lower()
+        vtags = v.get('tags', {}) or {}
 
-        # -------------------- MODIFIED: HDR 判定统一 --------------------
-        hdr_features = sum([
-            color_primaries in HDR_PRIMARIES,
-            color_transfer in HDR_TRANSFERS,
-            color_space in HDR_COLOR_SPACES,
-            pix_fmt in HDR_PIXFMTS
-        ])
-        hdr_flag = hdr_features >= 2  # 至少两个特征匹配即判定 HDR
+        # Stream first, then tags fallback
+        color_primaries = (v.get('color_primaries') or vtags.get('COLOR_PRIMARIES')
+                           or tags.get('COLOR_PRIMARIES') or 'bt709').lower()
 
-        master_display = _get_tag(tags, 'master-display', 'MASTER_DISPLAY', 'master_display', 'mastering_display', default='')
-        max_cll = _get_tag(tags, 'max-cll', 'MAX_CLL', 'max_cll', 'max-cll', default='')
+        color_transfer = (v.get('color_transfer') or vtags.get('COLOR_TRANSFER')
+                          or tags.get('COLOR_TRANSFER') or 'bt709').lower()
 
-        audio_stream = next((s for s in info.get('streams', []) if s.get('codec_type') == 'audio'), None)
-        if audio_stream:
-            atags = audio_stream.get('tags', {}) or {}
-            audio_lang = atags.get('language') or atags.get('LANGUAGE') or 'eng'
-            audio_channels = int(audio_stream.get('channels', audio_stream.get('CHANNELS', 2)))
+        color_space = (v.get('color_space') or vtags.get('COLOR_SPACE')
+                       or tags.get('COLOR_SPACE') or 'bt709').lower()
+        if color_space.startswith("bt2020"):
+            color_space = "bt2020nc"
+
+        pix_fmt = (v.get('pix_fmt') or 'yuv420p').lower()
+
+        # chroma location
+        chromaloc = v.get('chroma_location') or tags.get('chroma_location') or 'left'
+        chromaloc_map = {"left": 0, "center": 1}
+        chromaloc_val = chromaloc_map.get(chromaloc.lower(), 0)
+
+        # -------------------- side_data_list (HDR INFO) --------------------
+        side = v.get('side_data_list', []) or []
+
+        mastering_display = ''
+        max_cll = ''
+
+        for sd in side:
+            if sd.get('side_data_type') == 'Mastering display metadata':
+                mastering_display = (
+                    f"G({sd['green_x']},{sd['green_y']})"
+                    f"B({sd['blue_x']},{sd['blue_y']})"
+                    f"R({sd['red_x']},{sd['red_y']})"
+                    f"WP({sd['white_point_x']},{sd['white_point_y']})"
+                    f"L({sd['max_luminance']},{sd['min_luminance']})"
+                )
+
+            if sd.get('side_data_type') == 'Content light level metadata':
+                max_cll = f"{sd.get('max_content')},{sd.get('max_average')}"
+
+        if (not mastering_display) or (not max_cll):
+            for fr in frames[:40]:   # 前 40 帧足够
+                sdl = fr.get("side_data_list") or []
+                for sd in sdl:
+                    if sd.get("side_data_type") == "Mastering display metadata" and not mastering_display:
+                        mastering_display = (
+                            f"G({sd['green_x']},{sd['green_y']})"
+                            f"B({sd['blue_x']},{sd['blue_y']})"
+                            f"R({sd['red_x']},{sd['red_y']})"
+                            f"WP({sd['white_point_x']},{sd['white_point_y']})"
+                            f"L({sd['max_luminance']},{sd['min_luminance']})"
+                        )
+
+                    if sd.get("side_data_type") == "Content light level metadata" and not max_cll:
+                        max_cll = f"{sd.get('max_content')},{sd.get('max_average')}"
+
+        # fallback to tags
+        if not mastering_display:
+            mastering_display = tags.get('master-display', tags.get('MASTER_DISPLAY', ''))
+
+        if not max_cll:
+            max_cll = tags.get('max-cll', tags.get('MAX_CLL', ''))
+
+        # -------------------- HDR DETECTION --------------------
+        hdr_flag = (
+            "2020" in color_primaries or
+            "2020" in color_space or
+            pix_fmt in ('yuv420p10le', 'p010le') or
+            mastering_display or
+            "pq" in color_transfer or
+            "smpte2084" in color_transfer or
+            "arib-std-b67" in color_transfer      # HLG
+        )
+
+        # -------------------- AUDIO --------------------
+        a = next((s for s in info.get('streams', []) if s.get('codec_type') == 'audio'), None)
+        if a:
+            at = a.get('tags', {}) or {}
+            audio_lang = (
+                at.get('language') or at.get('LANGUAGE') or
+                at.get('lang') or at.get('LANG') or 'eng'
+            )
+            audio_channels = int(a.get('channels', 2))
         else:
             audio_lang = None
             audio_channels = 0
 
-        # 尝试读取帧数和时长
-        nb_frames = None
-        duration = None
+        # -------------------- duration / frames --------------------
         try:
             nb_frames = int(v.get('nb_frames')) if v.get('nb_frames') else None
-        except Exception:
+        except:
             nb_frames = None
+
         try:
             duration = float(info.get('format', {}).get('duration')) if info.get('format', {}).get('duration') else None
-        except Exception:
+        except:
             duration = None
 
         return VideoInfo(
             width, height, fps,
             color_primaries, color_transfer, color_space, pix_fmt,
-            master_display, max_cll, audio_channels, hdr_flag, audio_lang, nb_frames, duration
+            mastering_display, max_cll,
+            audio_channels, hdr_flag, audio_lang,
+            nb_frames, duration,
+            chromaloc_val
         )
 
     except Exception as e:
-        logger.error(f"探测媒体信息失败: {file_path.name}, {e}")
-        return VideoInfo(1920, 1080, 30.0, 'bt709', 'bt709', 'bt709', 'yuv420p', '', '', 2, False, 'eng', None, None)
+        logger.error(f"probe failed: {file_path.name}, {e}")
+        return VideoInfo(1920, 1080, 30.0, 'bt709', 'bt709', 'bt709', 'yuv420p', '', '', 2, False, 'eng', None, None, 0)
 
 # -------------------- Apple Validator --------------------
 def detect_validator_path() -> Optional[Path]:
