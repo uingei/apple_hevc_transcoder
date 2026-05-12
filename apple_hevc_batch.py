@@ -624,11 +624,6 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
             f'profile={profile}',
             f'level-idc={level}'
         ]
-        if hdr:
-            hdr_params = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=False, info=info)
-            # hdr_params is ['-x265-params', '...'] — merge the rhs into x265_params
-            if len(hdr_params) == 2 and hdr_params[0] == '-x265-params':
-                x265_params += hdr_params[1].split(':')
         vparams = ['-x265-params', ':'.join(x265_params), '-threads', '0']
         return FFmpegParams('libx265', pix_fmt, profile, level, [], vparams, [])
 
