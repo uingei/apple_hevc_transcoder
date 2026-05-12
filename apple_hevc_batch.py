@@ -462,6 +462,22 @@ def ensure_bitstream_headers(vparams: List[str], encoder: str='x265', ensure_rep
         return out
     return out
 
+def apple_color_pipeline(hdr: bool):
+    if hdr:
+        return [
+            "-color_primaries", "bt2020",
+            "-color_trc", "smpte2084",
+            "-colorspace", "bt2020nc",
+            "-color_range", "tv"
+        ]
+    else:
+        return [
+            "-color_primaries", "bt709",
+            "-color_trc", "bt709",
+            "-colorspace", "bt709",
+            "-color_range", "tv"
+        ]
+
 # -------------------- build hdr metadata --------------------
 def build_hdr_metadata(master_display: str, max_cll: str, use_nvenc: bool, info: VideoInfo) -> List[str]:
     master_display = (master_display or '').strip()
@@ -527,32 +543,18 @@ NVENC_RETRIES = [
 ]
 
 def adjust_nvenc_params(params: List[str], attempt: int) -> List[str]:
-    # convert param list to dict sequence preserving order, then apply retry modifications
-    param_dict = OrderedDict()
-    i = 0
-    new_params = params.copy()
-    while i < len(new_params):
-        k = new_params[i]
-        v = ''
-        if i + 1 < len(new_params) and not str(new_params[i+1]).startswith('-'):
-            v = str(new_params[i+1])
-            i += 2
-        else:
-            i += 1
-        param_dict[k] = v
     if attempt <= 0:
-        # no changes
-        rebuilt = []
-        for k, v in param_dict.items():
-            rebuilt.append(k)
-            if v != '':
-                rebuilt.append(v)
-        return rebuilt
-    idx = min(max(1, attempt), len(NVENC_RETRIES)) - 1
-    retry_mods = NVENC_RETRIES[idx]
-    for k, v in retry_mods.items():
-        param_dict[k] = v
-    rebuilt = []
+        return params
+
+    mods = NVENC_RETRIES[min(attempt-1, len(NVENC_RETRIES)-1)]
+
+    out = params.copy()
+    for k, v in mods.items():
+        if k in out:
+            i = out.index(k)
+            if i + 1 < len(out):
+                out[i + 1] = v
+    return out
     for k, v in param_dict.items():
         rebuilt.append(k)
         if v != '':
@@ -705,16 +707,11 @@ def build_ffmpeg_command_unified(
         cmd += list(ff_params.vparams)
 
     # hdr metadata & color atoms: ensure we write both metadata tags and color flags so ffmpeg writes colr atom
-    if ff_params.hdr_metadata:
-        cmd += list(ff_params.hdr_metadata)
-
-    # write explicit color metadata flags if present (helpful for colr atom)
-    # sometimes ff_params.color_flags may be empty: for nvenc hdr we used hdr_metadata to include color flags
-    if ff_params.color_flags:
-        cmd += ff_params.color_flags
+    cmd += apple_color_pipeline(info.hdr)
 
     # set chroma sample location explicitly if needed to avoid ambiguity
-    cmd += ['-chroma_sample_location', 'left']  # explicit; Apple often expects chroma loc defined
+    if info.pix_fmt.startswith("yuv420"):
+        cmd += ['-chroma_sample_location', 'left']
 
     # standard video metadata
     cmd += VIDEO_METADATA_FLAGS
