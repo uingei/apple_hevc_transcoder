@@ -480,42 +480,58 @@ def apple_color_pipeline(hdr: bool):
 
 # -------------------- build hdr metadata --------------------
 def build_hdr_metadata(master_display: str, max_cll: str, use_nvenc: bool, info: VideoInfo) -> List[str]:
+    """
+    Apple-safe HDR metadata strategy:
+
+    IMPORTANT:
+    - Do NOT inject master_display / max_cll as MP4 container metadata.
+    - Apple trusts HEVC bitstream SEI more than container tags.
+    - Only write proper color atom + encoder HDR signaling.
+    """
+
+    if use_nvenc:
+        return [
+            '-color_primaries', 'bt2020',
+            '-color_trc', 'smpte2084',
+            '-colorspace', 'bt2020nc',
+        ]
+
+    # x265 path
     master_display = (master_display or '').strip()
     max_cll = (max_cll or '').strip()
+
     if not master_display:
-        master_display = 'G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)'
+        master_display = (
+            'G(13250,34500)'
+            'B(7500,3000)'
+            'R(34000,16000)'
+            'WP(15635,16450)'
+            'L(10000000,50)'
+        )
+
     if not max_cll:
         max_cll = '1000,400'
 
-    if use_nvenc:
-        # For NVENC: write both metadata tags and color flags to ensure colr atom and tags match.
-        meta_list = [
-            '-metadata:s:v:0', f'color_primaries=bt2020',
-            '-metadata:s:v:0', f'color_trc=smpte2084',
-            '-metadata:s:v:0', f'colorspace=bt2020nc',
-            '-metadata:s:v:0', f'master_display={master_display}',
-            '-metadata:s:v:0', f'max_cll={max_cll}'
-        ]
-        # Also provide ffmpeg color flags which will generate colr atom
-        meta_list += ['-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc']
-        # ensure content light level atoms via metadata tags (some ffmpeg builds will write max_cll into CLL atom)
-        return meta_list
-    else:
-        # For x265: form x265 param string that includes mastering info
-        x265_hdr = [
-            'hdr10=1',
-            'colorprim=bt2020',
-            'transfer=smpte2084',
-            'colormatrix=bt2020nc',
-            f'master-display={master_display}',
-            f'max-cll={max_cll}',
-            'hrd=1',
-            'aud=1',
-            'chromaloc=0',
-            'repeat-headers=1'
-        ]
-        # return as a -x265-params argument handled by build_ffmpeg_params
-        return ['-x265-params', ':'.join(x265_hdr)]
+    x265_hdr = [
+        'hdr10=1',
+        'hdr10-opt=1',
+
+        'repeat-headers=1',
+        'aud=1',
+
+        'colorprim=bt2020',
+        'transfer=smpte2084',
+        'colormatrix=bt2020nc',
+
+        'chromaloc=2',
+
+        f'master-display={master_display}',
+        f'max-cll={max_cll}',
+
+        'hrd=1',
+    ]
+
+    return ['-x265-params', ':'.join(x265_hdr)]
 
 # -------------------- choose params --------------------
 def select_nvenc_preset(info: VideoInfo, gpu_name: str) -> str:
@@ -588,22 +604,44 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
         # Note: NVENC parameters are provided as ffmpeg encoder options (pairs)
         vparams = [
             '-rc', 'vbr',
+
             '-tune', 'hq',
             '-multipass', 'fullres',
+
             '-cq', str(cq),
+
             '-b:v', '0',
+
             '-maxrate', str(vbv_maxrate_kbps * 1000),
             '-bufsize', str(vbv_bufsize_kbits * 1000),
-            '-bf', '3',
-            '-b_ref_mode', 'middle',
-            '-rc-lookahead', str(lookahead),
-            '-spatial-aq', '1',
-            '-aq-strength', str(aq_strength),
-            '-temporal-aq', '1',
+
             '-preset', preset,
-            '-no-scenecut', '1',
+
+            '-profile:v', profile,
+
             '-g', str(gop),
-            '-tier', tier
+            '-keyint_min', str(gop),
+
+            '-forced-idr', '1',
+
+            '-strict_gop', '1',
+
+            '-bf', '2',
+
+            '-b_ref_mode', 'middle',
+
+            '-rc-lookahead', str(lookahead),
+
+            '-spatial-aq', '1',
+            '-temporal-aq', '1',
+
+            '-aq-strength', str(aq_strength),
+
+            '-aud', '1',
+
+            '-repeat-headers', '1',
+
+            '-tier', tier,
         ]
         vparams = ensure_bitstream_headers(vparams, encoder='nvenc', ensure_repeat=True, ensure_aud=True, ensure_chromaloc=False)
         hdr_metadata = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=True, info=info) if hdr else []
@@ -668,73 +706,145 @@ def build_ffmpeg_command_unified(
     audio_channels: int,
     audio_language: Optional[str] = 'eng',
     extra_vparams: Optional[List[str]] = None,
-    debug: bool = False
+    debug: bool = False,
+    hdr: bool = False,
 ) -> List[str]:
-    """
-    Build ffmpeg command with deterministic ordering to maximize Apple's validator acceptance:
-    ordering:
-      ffmpeg -hide_banner -y -i input -map 0 -c:v <encoder> -profile:v ... -pix_fmt ... -tag:v hvc1
-        [encoder params / x265-params or nvenc vparams]
-        [hdr metadata as -metadata:s:v:0 ... and also -color_primaries ... flags]
-        [video metadata flags]
-        [audio metadata & audio codec flags]
-        [-color_range tv -brand mp42 -movflags +write_colr+use_metadata_tags+faststart]
-        output
-    """
-    cmd = ['ffmpeg', '-hide_banner', '-y', '-i', str(file_path)]
 
-    # map everything from source; this preserves attachments/subtitles/chapters unless user wants to strip
-    cmd += ['-map', '0']
+    cmd = [
+        'ffmpeg',
 
-    # video encoder/profiles
-    cmd += ['-c:v', ff_params.vcodec]
-    # profile setting is valid for many encoders; place early
-    cmd += ['-profile:v', ff_params.profile]
-    # pixel format for output
-    cmd += ['-pix_fmt', ff_params.pix_fmt]
-    # tag as hvc1 (Apple often expects hvc1 box)
-    cmd += ['-tag:v', 'hvc1']
+        '-hide_banner',
+        '-y',
 
-    # add encoder-specific parameters (x265 or nvenc)
+        '-fflags', '+genpts',
+
+        '-avoid_negative_ts', 'make_zero',
+
+        '-i', str(file_path),
+    ]
+
+    # Apple-safe stream mapping
+    cmd += [
+        '-map', '0:v:0',
+        '-map', '0:a?',
+    ]
+
+    # strip dirty metadata
+    cmd += [
+        '-map_metadata', '-1',
+        '-map_chapters', '-1',
+    ]
+
+    # video
+    cmd += [
+        '-c:v', ff_params.vcodec,
+
+        '-tag:v', 'hvc1',
+
+        '-pix_fmt', ff_params.pix_fmt,
+
+        '-profile:v', ff_params.profile,
+    ]
+
+    # CFR only
+    cmd += [
+        '-vsync', 'cfr',
+        '-fps_mode', 'cfr',
+    ]
+
+    # stable Apple timing
+    cmd += [
+        '-video_track_timescale', '60000',
+    ]
+
+    # encoder params
     if extra_vparams:
         cmd += list(extra_vparams)
     else:
         cmd += list(ff_params.vparams)
 
-    # hdr metadata & color atoms: ensure we write both metadata tags and color flags so ffmpeg writes colr atom
-    cmd += apple_color_pipeline(info.hdr)
+    # HDR color atom
+    if ff_params.hdr_metadata:
+        cmd += list(ff_params.hdr_metadata)
 
-    # set chroma sample location explicitly if needed to avoid ambiguity
-    if info.pix_fmt.startswith("yuv420"):
-        cmd += ['-chroma_sample_location', 'left']
+    # chroma location
+    if hdr:
+        cmd += [
+            '-chroma_sample_location',
+            'topleft',
+        ]
+    else:
+        cmd += [
+            '-chroma_sample_location',
+            'left',
+        ]
 
-    # standard video metadata
-    cmd += VIDEO_METADATA_FLAGS
+    # video metadata
+    cmd += [
+        '-metadata:s:v:0',
+        'handler_name=VideoHandler',
+    ]
 
     # audio
     if audio_channels and audio_channels > 0:
-        audio_meta = [s for s in AUDIO_METADATA_TEMPLATE]
-        # substitute language placeholder
-        for i, t in enumerate(audio_meta):
-            if '{lang}' in t:
-                audio_meta[i] = t.format(lang=(audio_language or 'und'))
-        cmd += audio_meta
-        cmd += get_audio_flags(audio_channels)
+
+        cmd += [
+            '-c:a', 'aac',
+
+            '-profile:a', 'aac_low',
+
+            '-ar', '48000',
+        ]
+
+        if audio_channels == 1:
+            cmd += ['-ac', '1']
+
+        elif audio_channels == 2:
+            cmd += ['-ac', '2']
+
+        elif audio_channels == 6:
+            cmd += [
+                '-ac', '6',
+                '-channel_layout', '5.1',
+            ]
+
+        elif audio_channels == 8:
+            cmd += [
+                '-ac', '8',
+                '-channel_layout', '7.1',
+            ]
+
+        else:
+            cmd += ['-ac', str(audio_channels)]
+
+        cmd += [
+            '-metadata:s:a:0',
+            f'language={audio_language or "und"}',
+
+            '-metadata:s:a:0',
+            'handler_name=SoundHandler',
+        ]
+
     else:
-        # if no audio, remove audio streams (explicit) to avoid creating empty audio tracks
         cmd += ['-an']
 
-    # set color range and container flags
-    cmd += ['-color_range', 'tv']
-    cmd += ['-brand', 'mp42']
-    # movflags: write colr atom and use metadata tags (helps Apple Validator); faststart to move moov to front
-    cmd += ['-movflags', '+write_colr+use_metadata_tags+faststart']
+    # Apple-safe MP4
+    cmd += [
+        '-movflags',
+        '+faststart+write_colr',
 
-    # ensure deterministic atom ordering by forcing metadata mapping; (ffmpeg orders as given)
+        '-brand',
+        'isom',
+
+        '-color_range',
+        'tv',
+    ]
+
     cmd += [str(out_path)]
 
     if debug:
         logger.debug("FFmpeg cmd: %s", " ".join(cmd))
+
     return cmd
 
 # -------------------- conversion --------------------
@@ -764,8 +874,16 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
         last_exc = None
         for attempt in range(1, NVENC_RETRIES_COUNT + 2):  # include final attempt without extra mods
             retry_vparams = adjust_nvenc_params(ff_params.vparams, attempt-1) if attempt > 1 else ff_params.vparams
-            cmd = build_ffmpeg_command_unified(file_path, out_path, ff_params, audio_channels=info.audio_channels,
-                                               audio_language=info.audio_language, extra_vparams=retry_vparams, debug=debug)
+            cmd = build_ffmpeg_command_unified(
+                file_path,
+                out_path,
+                ff_params,
+                audio_channels=info.audio_channels,
+                audio_language=info.audio_language,
+                extra_vparams=retry_vparams,
+                debug=debug,
+                hdr=info.hdr,
+            )
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8', timeout=FFMPEG_TIMEOUT)
                 # success; run validator if requested
@@ -807,8 +925,15 @@ def convert_video(file_path: Path, out_dir: Path, debug: bool = False,
     # CPU path
     if not use_nvenc:
         ff_params_cpu = build_ffmpeg_params(info, False, gpu_name)
-        cmd_cpu = build_ffmpeg_command_unified(file_path, out_path, ff_params_cpu, audio_channels=info.audio_channels,
-                                               audio_language=info.audio_language, debug=debug)
+        cmd_cpu = build_ffmpeg_command_unified(
+            file_path,
+            out_path,
+            ff_params_cpu,
+            audio_channels=info.audio_channels,
+            audio_language=info.audio_language,
+            debug=debug,
+            hdr=info.hdr,
+        )
         try:
             subprocess.run(cmd_cpu, check=True, capture_output=True, text=True, encoding='utf-8', timeout=FFMPEG_TIMEOUT)
             log_entry.update({"status": "SUCCESS", "quality": crf, "retries": 0, "method": "CPU"})
