@@ -171,14 +171,22 @@ def calculate_apple_hevc_level(info: VideoInfo) -> Tuple[str, str]:
     samples_per_sec = round(samples_per_frame * fps)
     max_dim = max(width, height)
 
-    for lvl, (max_samples, max_rate, _, _, main_tier_max, high_tier_max) in HEVC_LEVEL_LIMITS.items():
+    # Apple HEVC spec hard limit: Level ≤ 5.1
+    # ref: https://developer.apple.com/documentation/beginning-media-playback/choosing-the-right-media-format
+    apple_max_level = "5.1"
+    apple_max_idx = list(HEVC_LEVEL_LIMITS.keys()).index(apple_max_level)
+
+    for idx, (lvl, (max_samples, max_rate, _, _, main_tier_max, high_tier_max)) in enumerate(HEVC_LEVEL_LIMITS.items()):
+        if idx > apple_max_idx:
+            continue
         if samples_per_frame <= max_samples and samples_per_sec <= max_rate:
             if info.hdr or max_dim >= 3840 or fps > 60:
                 tier = "high" if samples_per_sec <= high_tier_max else "main"
             else:
                 tier = "main"
             return lvl, tier
-    return "6.2", "main"
+    # Everything above 5.1 is clamped to 5.1 (Apple max allowed)
+    return apple_max_level, "high"
 
 def calculate_nvenc_hevc_level(info: VideoInfo) -> Tuple[str, str, str, str]:
     width, height, fps = info.width, info.height, info.fps
@@ -192,19 +200,18 @@ def calculate_nvenc_hevc_level(info: VideoInfo) -> Tuple[str, str, str, str]:
     else:
         profile = "main"
         pix_fmt = "yuv420p"
-    # Level selection — allow higher headroom for bitrate efficiency:
+    # Level selection — Apple HEVC spec hard limit: Level ≤ 5.1
+    # ref: https://developer.apple.com/documentation/beginning-media-playback/choosing-the-right-media-format
     #   ≤1080p: Level 4.1 (max 30Mbps, enough for 1080p30 8-12Mbps)
     #   ≤1440p: Level 5.0 (max 12Mbps per spec, but NVENC pushes higher)
     #   ≤4K:   Level 5.1  (Apple max allowed, 24Mbps cap)
-    #   >4K:   Level 5.2  (8K headroom)
+    #   >4K:   Level 5.1  (clamped from 5.2 — Apple never supports >5.1)
     if max_dim <= 1920:
         level = "4.1"
     elif max_dim <= 2560:
         level = "5.0"
-    elif max_dim <= 3840:
-        level = "5.1"
     else:
-        level = "5.2"
+        level = "5.1"  # 4K+ clamped to Apple ceiling
     return level, tier, profile, pix_fmt
 
 def compute_aligned_gop(fps: float, preferred_gop_sec: float, max_gop_frames: int = 240) -> int:
