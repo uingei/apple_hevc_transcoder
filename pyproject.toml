@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apple-hevc-transcoder"
-version = "1.7.0"
+version = "1.7.1"
 description = "Apple HEVC (H.265) batch transcoder — SDR/HDR compliant, NVENC-aware, iOS/QuickTime ready"
 readme = "README.md"
 license = {text = "MIT"}
