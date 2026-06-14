@@ -397,9 +397,11 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
     else:
         # x265 参数 — VUI 色彩元数据必须通过 -x265-params 写入 bitstream，
         # 否则被 -flags +global_header 重置。
+        # Advanced: no-open-gop=1 (closed GOP for seeking), psy-rd=1.0 (detail retention),
+        # aq-mode=4 (edge-preservation AQ) — Apple Review quality expectations
         x265_vui_params = (
-            f"colourprim=bt709:transfer=bt709:colmatrix=bt709"
-            if not hdr else ""
+            "no-open-gop=1:psy-rd=1.0:aq-mode=4:colourprim=bt709:transfer=bt709:colmatrix=bt709"
+            if not hdr else "no-open-gop=1:psy-rd=1.0:aq-mode=4"
         )
         x265_cmd_flags = [
             '-preset', 'veryslow',
@@ -412,8 +414,7 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
             # Apple: global_header = repeat-headers (SPS/PPS before IDR), cgop = aud
             '-flags', '+global_header+cgop',
         ]
-        if x265_vui_params:
-            x265_cmd_flags.extend(['-x265-params', x265_vui_params])
+        x265_cmd_flags.extend(['-x265-params', x265_vui_params])
         if hdr:
             hdr_params = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=False, fps=info.fps)
             x265_cmd_flags.extend(hdr_params)
