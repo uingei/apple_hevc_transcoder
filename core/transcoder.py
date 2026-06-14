@@ -397,12 +397,24 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
     else:
         # x265 参数 — VUI 色彩元数据必须通过 -x265-params 写入 bitstream，
         # 否则被 -flags +global_header 重置。
-        # Advanced: no-open-gop=1 (closed GOP for seeking), psy-rd=1.0 (detail retention),
-        # aq-mode=4 (edge-preservation AQ) — Apple Review quality expectations
-        x265_vui_params = (
-            "no-open-gop=1:psy-rd=1.0:aq-mode=4:colourprim=bt709:transfer=bt709:colmatrix=bt709"
-            if not hdr else "no-open-gop=1:psy-rd=1.0:aq-mode=4"
-        )
+        # 高级参数 (no-open-gop, psy-rd, aq-mode) 必须与 VUI 参数在同一 -x265-params 调用中，
+        # 否则 FFmpeg 对重复 -x265-params 的处理会丢失前者（实测后者完全覆盖前者）。
+        advanced = "no-open-gop=1:psy-rd=1.0:aq-mode=4"
+        if hdr:
+            x265_vui_params = (
+                f"{advanced}:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"
+                f":hrd=1:aud=1:chromaloc=0:repeat-headers=1"
+            )
+            master_display = (info.master_display or '').strip()
+            max_cll = (info.max_cll or '').strip()
+            if not master_display:
+                master_display = 'G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)'
+            if not max_cll:
+                max_cll = '1000,400'
+            x265_vui_params += f":master-display={master_display}:max-cll={max_cll}"
+        else:
+            x265_vui_params = f"{advanced}:colourprim=bt709:transfer=bt709:colmatrix=bt709"
+        
         x265_cmd_flags = [
             '-preset', 'veryslow',
             '-crf', str(crf),
@@ -414,10 +426,8 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
             # Apple: global_header = repeat-headers (SPS/PPS before IDR), cgop = aud
             '-flags', '+global_header+cgop',
         ]
+        # 单次 -x265-params 调用，包含高级参数 + VUI 参数（HDR 参数内联在此处）
         x265_cmd_flags.extend(['-x265-params', x265_vui_params])
-        if hdr:
-            hdr_params = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=False, fps=info.fps)
-            x265_cmd_flags.extend(hdr_params)
         # libx265 自动线程
         x265_cmd_flags.extend(['-threads', '0'])
         vparams = x265_cmd_flags
