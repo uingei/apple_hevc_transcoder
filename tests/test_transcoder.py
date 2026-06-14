@@ -3,8 +3,7 @@
 import unittest
 from pathlib import Path
 import threading
-from core.transcoder import convert_video
-from core.probe import probe_media
+from core.transcoder import convert_video, is_hdr, probe_video
 
 class TestTranscoder(unittest.TestCase):
 
@@ -15,7 +14,7 @@ class TestTranscoder(unittest.TestCase):
 
     def test_probe_video(self):
         for f in self.test_dir.glob("*"):
-            info = probe_media(f)
+            info = probe_video(f)
             self.assertGreater(info.width, 0)
             self.assertGreater(info.height, 0)
             self.assertGreater(info.fps, 0)
@@ -23,8 +22,8 @@ class TestTranscoder(unittest.TestCase):
 
     def test_is_hdr_detection(self):
         for f in self.test_dir.glob("*"):
-            info = probe_media(f)
-            hdr_flag = info.hdr
+            info = probe_video(f)
+            hdr_flag = is_hdr(info)
             print(f"{f.name} HDR: {hdr_flag}")
 
     def test_convert_video_cpu(self):

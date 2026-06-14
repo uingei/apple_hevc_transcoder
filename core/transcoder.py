@@ -42,9 +42,7 @@ def detect_validator_path() -> Optional[Path]:
     ]
     return next((p for p in possible_paths if p.exists()), None)
 
-# 线程安全锁：防止多任务并发调用 Validator 导致冲突
-validator_lock = threading.Lock()
-
+# -------------------- Replacement: run_apple_validator (no lru_cache) --------------------
 def run_apple_validator(file_path: Path, refresh_cache=False) -> bool:
     """
     直接运行 Validator（不缓存结果）：文件内容变化或重试时缓存会误导判断，所以不使用 lru_cache。
@@ -135,16 +133,24 @@ def adjust_nvenc_params(params: List[str], attempt: int) -> List[str]:
             rebuilt.append(str(v))
     return rebuilt
 
-def ensure_bitstream_headers(vparams: List[str], encoder: str='nvenc', ensure_aud: bool=True) -> List[str]:
+def ensure_bitstream_headers(vparams: List[str], encoder: str='x265', ensure_repeat=True, ensure_aud=True, ensure_chromaloc=True) -> List[str]:
     """
-    确保 vparams（flat list）包含 aud 等 bitstream flags。
-    encoder 参数保留以兼容旧调用接口。
+    确保 vparams（flat list）包含 repeat-headers / aud / chromaloc 等标志（若未出现则追加）。
+    encoder: 'x265' 或 'nvenc'
     """
     s = ' '.join(map(str, vparams))
     out = vparams.copy()
 
+    # repeat-headers 仅针对 x265
+    # if ensure_repeat and 'repeat-headers' not in s and '-repeat-headers' not in s:
+    #     out += ['-repeat-headers', '1']
+
     if ensure_aud and 'aud=1' not in s and '-aud' not in s:
         out += ['-aud', '1']
+
+    # chromaloc 仅在 x265 下有效
+    if ensure_chromaloc and encoder.lower() == 'x265' and ('chromaloc' not in s and '-chromaloc' not in s and 'chromaloc=0' not in s):
+        out += ['-chromaloc', '0']
 
     return out
 
@@ -192,15 +198,10 @@ def calculate_nvenc_hevc_level(info: VideoInfo) -> Tuple[str, str, str, str]:
     else:
         profile = "main"
         pix_fmt = "yuv420p"
-    # Level selection — allow higher headroom for bitrate efficiency:
-    #   ≤1080p: Level 4.1 (max 30Mbps, enough for 1080p30 8-12Mbps)
-    #   ≤1440p: Level 5.0 (max 12Mbps per spec, but NVENC pushes higher)
-    #   ≤4K:   Level 5.1  (Apple max allowed, 24Mbps cap)
-    #   >4K:   Level 5.2  (8K headroom)
     if max_dim <= 1920:
-        level = "4.1"
+        level = "4.0"
     elif max_dim <= 2560:
-        level = "5.0"
+        level = "4.1"
     elif max_dim <= 3840:
         level = "5.1"
     else:
@@ -269,11 +270,8 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
     fps = float(info.fps) if info.fps else 30.0
     hdr = bool(info.hdr)
 
-    # CRF baseline — aligned with x265 quality scale & Apple target quality:
-    #   SDR: CRF 20-22 (visually good, Apple streaming range)
-    #   HDR: CRF 19-21 (10-bit headroom allows slightly tighter CRF)
-    # ref: https://trac.ffmpeg.org/wiki/x265EncodingGuide
-    crf_base_table = {480: 22, 720: 21, 1080: 20, 1440: 20, 2160: 20, 4320: 19}
+    # 基线 CRF（按高度桶）
+    crf_base_table = {480: 17, 720: 18, 1080: 19, 1440: 20, 2160: 21, 4320: 22}
     keys = sorted(crf_base_table.keys())
     chosen = keys[-1]
     for k in keys:
@@ -282,28 +280,41 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
             break
     crf = crf_base_table[chosen]
     if hdr:
-        crf = max(16, crf - 1)
+        crf = max(8, crf - 1)
+
+    # 估计帧数 & 动作密度（frames / pixels）
+    if info.nb_frames:
+        est_frames = info.nb_frames
+    elif info.duration:
+        est_frames = int(round(info.duration * fps))
+    else:
+        est_frames = int(round(60 * fps))
+
+    motion_density = est_frames / (info.width * info.height + 1)
+    if motion_density > 0.00025:
+        crf += 1
+    elif motion_density < 0.00006:
+        crf = max(8, crf - 1)
 
     crf = max(16, min(crf, 24))
     cq = crf + 1
 
-    # Target bitrate — aligned with Apple HLS encoding guidelines (HEVC):
-    #   1080p30 SDR ~8Mbps, HDR ~12Mbps
-    #   1440p30 SDR ~12Mbps, HDR ~16Mbps
-    #   4K30    SDR ~16Mbps, HDR ~25Mbps
-    #   720p30  SDR ~4Mbps,  HDR ~6Mbps
-    #   8K      SDR ~80Mbps, HDR ~100Mbps
-    # ref: https://developer.apple.com/streaming/
+    # target kbps 基于分辨率与 HDR
     if max_dim >= 7680:
-        target_kbps = 100000 if hdr else 80000
+        target_kbps = 140000
     elif max_dim >= 3840:
-        target_kbps = 25000 if hdr else 16000
+        target_kbps = 65000 if hdr else 50000
     elif max_dim >= 2560:
-        target_kbps = 16000 if hdr else 12000
+        target_kbps = 30000 if hdr else 26000
     elif max_dim >= 1920:
-        target_kbps = 12000 if hdr else 8000
+        target_kbps = 19000 if hdr else 16000
     else:
-        target_kbps = 6000 if hdr else 4000
+        target_kbps = 10000 if hdr else 8000
+
+    if motion_density > 0.00025:
+        target_kbps = int(target_kbps * 1.15)
+    elif motion_density < 0.00006:
+        target_kbps = int(target_kbps * 0.92)
 
     vbv_maxrate = int(target_kbps)               # kbps
     vbv_bufsize = int(vbv_maxrate * 1.5)         # kbits
@@ -324,15 +335,13 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
         # 若 level table 解析失败，保留原先的估算值
         pass
 
-    # ── Apple HEVC Compliance: GOP ≤ 2 seconds ──
-    # Apple 明确推荐 keyframe 间隔不超过 2 秒（ceil(fps × 2)）
-    # ref: <https://developer.apple.com/documentation/live-streaming/encoding-live-video>
+    # GOP（秒级 -> 帧数），优先对齐到整数 fps 秒边界（Apple 播放优化）
     if hdr:
-        gop_sec = 2.0
-    elif fps > 30:
-        gop_sec = 2.0
+        gop_sec = 2.0 if max_dim >= 3840 else 2.5
     else:
-        gop_sec = 2.0  # 统一 2 秒，严格遵循 Apple 规范
+        gop_sec = 2.5 if max_dim >= 3840 else 3.0
+    if fps > 60:
+        gop_sec *= 1.05
 
     gop_frames = compute_aligned_gop(fps, gop_sec, max_gop_frames=240)
 
@@ -352,7 +361,7 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
     else:
         level, tier = calculate_apple_hevc_level(info)
         profile = 'main10' if hdr else 'main'
-        pix_fmt = 'yuv420p10le' if hdr else 'yuv420p'
+        pix_fmt = 'p010le' if hdr else 'yuv420p'
 
     crf, cq, vbv_maxrate_kbps, vbv_bufsize_kbits, gop = calculate_dynamic_values(info, use_nvenc, gpu_name)
 
@@ -377,41 +386,29 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
             '-spatial-aq', '1', '-aq-strength', str(aq_strength),
             '-temporal-aq', '1', '-preset', preset,
             '-no-scenecut', '1', '-g', str(gop),
-            '-tier', tier,
-            # Apple HEVC compliance: explicit level constraint
-            '-level', level,
+            '-tier', tier
         ]
         # 在 vparams 最终确定后，强制补齐 bitstream header flags
-        vparams = ensure_bitstream_headers(vparams, encoder='nvenc', ensure_aud=True)
+        vparams = ensure_bitstream_headers(vparams, encoder='nvenc', ensure_repeat=True, ensure_aud=True, ensure_chromaloc=True)
 
         hdr_metadata = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=True, fps=info.fps) if hdr else []
         return FFmpegParams('hevc_nvenc', pix_fmt, profile, level, [], vparams, hdr_metadata)
     else:
-        # x265 参数 — VUI 色彩元数据必须通过 -x265-params 写入 bitstream，
-        # 否则被 -flags +global_header 重置。
-        x265_vui_params = (
-            f"colourprim=bt709:transfer=bt709:colmatrix=bt709"
-            if not hdr else ""
-        )
-        x265_cmd_flags = [
-            '-preset', 'veryslow',
-            '-crf', str(crf),
-            '-g', str(gop),
-            '-bf', '3',
-            '-maxrate', str(vbv_maxrate_kbps * 1000),
-            '-bufsize', str(vbv_bufsize_kbits * 1000),
-            '-level', level,
-            # Apple: global_header = repeat-headers (SPS/PPS before IDR), cgop = aud
-            '-flags', '+global_header+cgop',
+        # x265 参数（注意 vbv 单位为 kbps）
+        x265_params = [
+            f'crf={crf}', 'preset=slow', 'log-level=error', 'nal-hrd=vbr',
+            f'vbv-maxrate={vbv_maxrate_kbps}', f'vbv-bufsize={vbv_bufsize_kbits}', f'tier={tier}',
+            f'keyint={gop}', f'min-keyint={max(2, int(gop//2))}',
+            f'profile={profile}', 'level-idc=' + str(level)
         ]
-        if x265_vui_params:
-            x265_cmd_flags.extend(['-x265-params', x265_vui_params])
         if hdr:
             hdr_params = build_hdr_metadata(info.master_display, info.max_cll, use_nvenc=False, fps=info.fps)
-            x265_cmd_flags.extend(hdr_params)
-        # libx265 自动线程
-        x265_cmd_flags.extend(['-threads', '0'])
-        vparams = x265_cmd_flags
+            if '-x265-params' in hdr_params:
+                idx = hdr_params.index('-x265-params')
+                x265_str = hdr_params[idx + 1]
+                x265_params += x265_str.split(':')
+        # threads=0 让 libx265 自动决定合理线程数（更兼容不同机器）
+        vparams = ['-x265-params', ':'.join(x265_params), '-threads', '0']
         return FFmpegParams('libx265', pix_fmt, profile, level, [], vparams, [])
 
 VIDEO_METADATA_FLAGS = ['-metadata:s:v:0', 'handler_name=VideoHandler']
@@ -460,39 +457,24 @@ def build_ffmpeg_command(
     audio_language: Optional[str] = 'eng',
     extra_vparams: Optional[List[str]] = None
 ) -> List[str]:
-    """
-    构建 FFmpeg 命令行。
-    关键修复：
-    1. 色彩元数据必须通过 -vf colorspace filter 写入（libx265 丢弃 -color_primaries CLI 选项）
-    2. 色彩 filter 在编码器之后注入
-    """
     cmd = [
         'ffmpeg', '-hide_banner', '-y', '-i', str(file_path),
+        '-map_metadata', '0',
         '-c:v', ff_params.vcodec,
         '-pix_fmt', ff_params.pix_fmt,
         '-profile:v', ff_params.profile,
         '-tag:v', 'hvc1',
     ]
 
+    if ff_params.hdr_metadata:
+        cmd.extend(ff_params.hdr_metadata)
+    #elif ff_params.color_flags:
+    #    cmd.extend(ff_params.color_flags)
+
     if extra_vparams:
         cmd.extend(extra_vparams)
     else:
         cmd.extend(ff_params.vparams)
-
-    # ── 色彩元数据策略 ──
-    # x265 SDR: colorspace filter 写入 VUI bt709（libx265 被 global_header 覆盖）
-    # x265 HDR: x265-params 已写入 VUI bt2020，filter 仅需写 colr atom（不覆盖 primaries）
-    # NVENC hdr_metadata 列表非空 → 走 HDR 路径
-    is_hdr = bool(ff_params.hdr_metadata) or ff_params.pix_fmt in ('yuv420p10le', 'p010le')
-    if is_hdr:
-        # 仅 format filter 转换 bit depth，不触碰色彩空间（已由 x265-params 写入 VUI）
-        cmd.extend(['-vf', f'format={ff_params.pix_fmt}'])
-        cmd.extend(ff_params.hdr_metadata)
-    else:
-        # SDR: bt709 colorimetry (Apple player compatibility)
-        cmd.extend([
-            '-vf', f"format={ff_params.pix_fmt},colorspace=bt709:iall=bt709"
-        ])
 
     cmd.extend(VIDEO_METADATA_FLAGS)
     if audio_channels and audio_channels > 0:
@@ -505,12 +487,9 @@ def build_ffmpeg_command(
 
         cmd.extend(common_flags)
         cmd.extend(get_audio_flags(audio_channels))
-
-    # ── Apple HEVC 容器合规 ──
     cmd.extend(['-color_range', 'tv'])
-    cmd.extend(['-brand', 'm4vA'])
-    cmd.extend(['-movflags', '+write_colr+faststart'])
-    cmd.extend(['-fflags', '+genpts'])
+    cmd.extend(['-brand', 'mp42'])
+    cmd.extend(['-movflags', '+write_colr+use_metadata_tags+faststart'])
     cmd.append(str(out_path))
 
     return cmd
@@ -570,7 +549,7 @@ def convert_video(
     返回字典: {"file","status","crf","retries","method","hdr"}
     stop_event: 可选 threading.Event，用于外部请求取消。
     """
-    info = probe_media(file_path)
+    info= probe_media(file_path)
     gpu_name = detect_gpu_type()
     out_path = out_dir / (file_path.stem + '.mp4')
     hdr = info.hdr

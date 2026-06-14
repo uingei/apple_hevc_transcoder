@@ -156,7 +156,7 @@ class FileItemWidget(QFrame):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Apple HEVC 批量转码 v1.7.0")
+        self.setWindowTitle("Apple HEVC 批量转码 v1.6.5")
         self.setWindowIcon(QIcon("icon.ico"))
         self.resize(900, 650)
         self.workers = []

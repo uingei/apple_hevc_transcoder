@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🍏 Apple HEVC 批量转码 GUI v1.7.0  
+# 🍏 Apple HEVC 批量转码 GUI v1.6.3  
 *A full-featured Windows GUI tool for Apple HEVC (H.265) batch transcoding*
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)]()
@@ -65,18 +65,12 @@
 
 | 项目 | 信息 |
 |------|------|
-|| 作者 | **uingei** |
-|| 版本 | **v1.7.0** |
-|| 许可证 | MIT License |
-|| 年份 | © 2026 uingei. All rights reserved. |
+| 作者 | **uingei** |
+| 版本 | **v1.6.3** |
+| 许可证 | MIT License |
+| 年份 | © 2025 uingei. All rights reserved. |
 
 ---
-
-## 🔄 Changelog
-
-| Version | Changes |
-|---------|---------|
-| **v1.7.0** | Apple HEVC 合规增强：GOP 统一 2s、x265 `level` 参数修复、`repeat-headers=1`/`aud=1` 强制执行、SDR 路径添加 bt709 colorimetry、`brand` 改为 Apple 推荐的 `isomav`、修复 `validator_lock` 未定义 bug、修复 `info=` 缺少空格、修复测试文件导入错误、版本统一、测试视频修复为真正的 10-bit HDR |
 
 ## 🏷️ 鸣谢 | Credits
 

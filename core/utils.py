@@ -54,10 +54,17 @@ def build_hdr_metadata(master_display: str, max_cll: str, use_nvenc: bool, fps: 
         meta_list.extend(['-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-colorspace', 'bt2020nc'])
         return meta_list
     else:
-        # x265 HDR — VUI 色彩 + HDR10 metadata 必须通过 -x265-params 写入，
-        # 否则被 global_header 丢弃。colourspace filter 辅助写入 container colr atom。
-        x265_hdr_params = (
-            f"colourprim=bt2020:transfer=smpte2084:colmatrix=bt2020nc:"
-            f"master-display={master_display}:max-cll={max_cll}"
-        )
-        return ['-x265-params', x265_hdr_params]
+        # x265 参数串，chromaloc=0 （你选择的）
+        x265_hdr = [
+            'hdr10=1',
+            'colorprim=bt2020',
+            'transfer=smpte2084',
+            'colormatrix=bt2020nc',
+            f'master-display={master_display}',
+            f'max-cll={max_cll}',
+            'hrd=1',
+            'aud=1',
+            'chromaloc=0',
+            'repeat-headers=1'
+        ]
+        return ['-x265-params', ':'.join(x265_hdr)]
