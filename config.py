@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "Apple HEVC 批量转码"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 LOG_FILE = "transcode_log.csv"
 
 INPUT_EXTS = (
@@ -11,6 +11,6 @@ INPUT_EXTS = (
     '.m4v', '.webm', '.3gp', '.f4v', '.ogv', '.vob', '.mpg', '.mpeg'
 )
 
-DEFAULT_CRF = 18
+DEFAULT_CRF = 20
 MAX_WORKERS_SDR = max(1, os.cpu_count() or 1)
 MAX_WORKERS_HDR = 2
