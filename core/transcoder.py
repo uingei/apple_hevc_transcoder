@@ -355,7 +355,7 @@ def build_ffmpeg_params(info: VideoInfo, use_nvenc: bool, gpu_name: str) -> FFmp
         profile = 'main10' if hdr else 'main'
         pix_fmt = 'yuv420p10le' if hdr else 'yuv420p'
 
-    crf, cq, vbv_maxrate_kbps, vbv_bufsize_kbits, gop = calculate_dynamic_values(info, use_nvenc, gpu_name)
+    crf, cq, vbv_maxrate_kbps, vbv_bufsize_kbits, gop = calculate_dynamic_values(info)
 
     if use_nvenc:
         preset = select_nvenc_preset(info, gpu_name)
@@ -588,8 +588,8 @@ def convert_video(
         "hdr": hdr
     }
 
-    crf, cq, _, _, _ = calculate_dynamic_values(info, use_nvenc=False)
-    _, nvenc_cq, _, _, _ = calculate_dynamic_values(info, use_nvenc=True, gpu_name=gpu_name)
+    crf, cq, _, _, _ = calculate_dynamic_values(info)
+    _, nvenc_cq, _, _, _ = calculate_dynamic_values(info)
 
     ff_params = build_ffmpeg_params(info, use_nvenc, gpu_name)
     total_frames = max(1, int(info.duration * info.fps)) if info.duration and info.fps else 1
