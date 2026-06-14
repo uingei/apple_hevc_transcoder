@@ -192,10 +192,15 @@ def calculate_nvenc_hevc_level(info: VideoInfo) -> Tuple[str, str, str, str]:
     else:
         profile = "main"
         pix_fmt = "yuv420p"
+    # Level selection — allow higher headroom for bitrate efficiency:
+    #   ≤1080p: Level 4.1 (max 30Mbps, enough for 1080p30 8-12Mbps)
+    #   ≤1440p: Level 5.0 (max 12Mbps per spec, but NVENC pushes higher)
+    #   ≤4K:   Level 5.1  (Apple max allowed, 24Mbps cap)
+    #   >4K:   Level 5.2  (8K headroom)
     if max_dim <= 1920:
-        level = "4.0"
-    elif max_dim <= 2560:
         level = "4.1"
+    elif max_dim <= 2560:
+        level = "5.0"
     elif max_dim <= 3840:
         level = "5.1"
     else:
@@ -264,8 +269,11 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
     fps = float(info.fps) if info.fps else 30.0
     hdr = bool(info.hdr)
 
-    # 基线 CRF（按高度桶）
-    crf_base_table = {480: 17, 720: 18, 1080: 19, 1440: 20, 2160: 21, 4320: 22}
+    # CRF baseline — aligned with x265 quality scale & Apple target quality:
+    #   SDR: CRF 20-22 (visually good, Apple streaming range)
+    #   HDR: CRF 19-21 (10-bit headroom allows slightly tighter CRF)
+    # ref: https://trac.ffmpeg.org/wiki/x265EncodingGuide
+    crf_base_table = {480: 22, 720: 21, 1080: 20, 1440: 20, 2160: 20, 4320: 19}
     keys = sorted(crf_base_table.keys())
     chosen = keys[-1]
     for k in keys:
@@ -274,41 +282,28 @@ def calculate_dynamic_values(info: VideoInfo, use_nvenc: bool = True, gpu_name: 
             break
     crf = crf_base_table[chosen]
     if hdr:
-        crf = max(8, crf - 1)
-
-    # 估计帧数 & 动作密度（frames / pixels）
-    if info.nb_frames:
-        est_frames = info.nb_frames
-    elif info.duration:
-        est_frames = int(round(info.duration * fps))
-    else:
-        est_frames = int(round(60 * fps))
-
-    motion_density = est_frames / (info.width * info.height + 1)
-    if motion_density > 0.00025:
-        crf += 1
-    elif motion_density < 0.00006:
-        crf = max(8, crf - 1)
+        crf = max(16, crf - 1)
 
     crf = max(16, min(crf, 24))
     cq = crf + 1
 
-    # target kbps 基于分辨率与 HDR
+    # Target bitrate — aligned with Apple HLS encoding guidelines (HEVC):
+    #   1080p30 SDR ~8Mbps, HDR ~12Mbps
+    #   1440p30 SDR ~12Mbps, HDR ~16Mbps
+    #   4K30    SDR ~16Mbps, HDR ~25Mbps
+    #   720p30  SDR ~4Mbps,  HDR ~6Mbps
+    #   8K      SDR ~80Mbps, HDR ~100Mbps
+    # ref: https://developer.apple.com/streaming/
     if max_dim >= 7680:
-        target_kbps = 140000
+        target_kbps = 100000 if hdr else 80000
     elif max_dim >= 3840:
-        target_kbps = 65000 if hdr else 50000
+        target_kbps = 25000 if hdr else 16000
     elif max_dim >= 2560:
-        target_kbps = 30000 if hdr else 26000
+        target_kbps = 16000 if hdr else 12000
     elif max_dim >= 1920:
-        target_kbps = 19000 if hdr else 16000
+        target_kbps = 12000 if hdr else 8000
     else:
-        target_kbps = 10000 if hdr else 8000
-
-    if motion_density > 0.00025:
-        target_kbps = int(target_kbps * 1.15)
-    elif motion_density < 0.00006:
-        target_kbps = int(target_kbps * 0.92)
+        target_kbps = 6000 if hdr else 4000
 
     vbv_maxrate = int(target_kbps)               # kbps
     vbv_bufsize = int(vbv_maxrate * 1.5)         # kbits
