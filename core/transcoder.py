@@ -526,9 +526,10 @@ def build_ffmpeg_command(
         cmd.extend(get_audio_flags(audio_channels))
 
     # ── Apple HEVC 容器合规 ──
+    # -brand 必须在 -movflags 之后写入（FFmpeg 后处理中 movflags 可能覆盖先前的 brand）
     cmd.extend(['-color_range', 'tv'])
-    cmd.extend(['-brand', 'm4vA'])
     cmd.extend(['-movflags', '+write_colr+faststart'])
+    cmd.extend(['-brand', 'm4vA'])
     cmd.extend(['-fflags', '+genpts'])
     cmd.append(str(out_path))
 
