@@ -1,0 +1,13 @@
+__pycache__
+*.py[cod]
+*.so
+*.egg-info
+dist
+build
+.eggs
+tests/output/*.mp4
+tests/sample_videos/
+.mypy_cache
+.python-version
+.env
+*.log
